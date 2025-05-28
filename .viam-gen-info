@@ -1,0 +1,13 @@
+{
+  "module_name": "yolov8",
+  "namespace": "azeneli",
+  "language": "python",
+  "resource_type": "service",
+  "resource_subtype": "vision",
+  "model_name": "yolov8",
+  "enable_cloud_build": true,
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2025-05-28T15:11:18.284261298Z",
+  "module_readme_link": "README.md"
+}
