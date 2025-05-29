@@ -20,6 +20,8 @@ from viam.utils import struct_to_dict
 from ultralytics.engine.results import Results
 from viam.components.camera import Camera, ViamImage
 from viam.media.utils.pil import viam_to_pil_image
+from shapely.geometry import Point, Polygon
+
 
 from ultralytics import YOLO
 import torch
@@ -32,6 +34,19 @@ MODEL_DIR = os.environ.get(
     "VIAM_MODULE_DATA", os.path.join(os.path.expanduser("~"), ".data", "models")
 ) 
 
+# Global states
+LABEL_WALK = 0  #"walking_by"
+LABEL_IN = 1 # "queue_in"
+LABEL_SUCCESS = 2 #  "queue_success"
+LABEL_FAIL = 3 #  "queue_fail"
+
+
+WAIT = "WAIT"
+SUCCESS = "SUCCESS"
+FAILURE = "ABANDON"
+ENTER = "ENTER"
+
+
 class Yolov8(Vision, EasyResource):
     # To enable debug-level logging, either run viam-server with the --debug option,
     # or configure your resource/machine to display debug logs.
@@ -40,6 +55,7 @@ class Yolov8(Vision, EasyResource):
     def __init__(self, name: str):
         super().__init__(name=name)
         self.camera_name = None
+        self.state_labels: dict[int, str] = {} 
 
         
     @classmethod
@@ -74,38 +90,32 @@ class Yolov8(Vision, EasyResource):
                 second element is a list of optional dependencies
         """
         optional_dependencies, required_dependencies = [], []
-        fields = config.attributes.fields
+        attrs = struct_to_dict(config.attributes)
 
-        # # Validate required dependencies
+        # # Validate required dependencies 
         # Validate camera name
-        if "camera_name" not in fields:
-            raise Exception("missing required camera_name attribute")
-        elif not fields["camera_name"].HasField("string_value"):
-            raise Exception("camera_name must be a string")
-        
-        camera_name = fields["camera_name"].string_value
-        required_dependencies.append(camera_name)
+        if "camera_name" not in attrs or not isinstance(attrs["camera_name"], str):
+            raise ValueError("camera is required and must be a string")
+        required_dependencies.append(attrs["camera_name"])
 
-        # Validate detector model location
-        if "model_location" not in fields:
-            raise Exception("missing required model_location attribute")
-        elif not fields["model_location"].HasField("string_value"):
-            raise Exception("model_location must be a string folder path")
+
+        # Validate detector model location 
+        if "model_location" not in attrs or not isinstance(attrs["model_location"], str):
+            raise ValueError("model_location is a required path to your model weights file (.pt) ")
         
-        LOGGER.info(f"FIELDS {fields}")
         # # Optional dependencies 
-        if "tracker_config_location" in fields:
-            LOGGER.info(f"Tracking enabled") 
+        if "tracker_config_location" in attrs:
+            LOGGER.info(f"Tracking enabled")
+            
+            if not isinstance(attrs["tracker_config_location"], str):
+                raise ValueError("tracker_config_location must be a string path to your config file")
 
-            # Validate tracker file type 
-            if not fields["tracker_config_location"].HasField("string_value"):
-                raise Exception("tracker_config_location must be a string")
-
-    
-        LOGGER.info(f"DEPENDENCIES {required_dependencies} {optional_dependencies}")
+        # Validate user-defined field (zones)
+        if "zones" not in attrs or not isinstance(attrs["zones"], dict):
+            raise ValueError("zones is required and must be a dictionary of polygon list coordinates")
         
-        return required_dependencies, []
 
+        return required_dependencies, []
 
 
     def reconfigure(
@@ -114,38 +124,20 @@ class Yolov8(Vision, EasyResource):
         # self.dependencies = dependencies
 
         attrs = struct_to_dict(config.attributes) 
+        LOGGER.info(f"Camera name {attrs["camera_name"]}")
 
         # Camera 
-        camera_component = dependencies[Camera.get_resource_name(attrs["camera_name"] )]
+        camera_component = dependencies[Camera.get_resource_name(attrs["camera_name"])] 
+
         self.camera = cast(Camera, camera_component)
 
         model_location = str(attrs.get("model_location"))
 
-
         self.task = str(attrs.get("task")) or None
+
         self.enable_tracker = False
 
-        if "/" in model_location:
-            if self.is_path(model_location):
-                self.MODEL_PATH = model_location
-            else:
-                model_name = str(attrs.get("model_name", ""))
-                if model_name == "":
-                    raise Exception(
-                        "model_name attribute is required for downloading models from HuggingFace."
-                    ) 
-                self.MODEL_REPO = model_location
-                self.MODEL_FILE = model_name
-                self.MODEL_PATH = os.path.abspath(
-                    os.path.join(
-                        MODEL_DIR,
-                        f"{self.MODEL_REPO.replace('/', '_')}_{self.MODEL_FILE}",
-                    )
-                )
-                self.get_model()
-
-            self.model = YOLO(self.MODEL_PATH, task=self.task)
-        else:
+        if self.is_path(model_location):
             self.model = YOLO(model_location, task=self.task)
 
 
@@ -164,8 +156,14 @@ class Yolov8(Vision, EasyResource):
 
         except Exception as e:
             raise Exception(f"Tracker configuration failed: {str(e)}") 
-            
+        
+        if self.enable_tracker: 
+            # Check for zones 
+            if "zones" in attrs: 
+                # Prepare zones for tracking use 
+                self.zones = self.prepare_zones(attrs["zones"])
 
+            
         # Check for CUDA (NVIDIA GPU)
         if torch.cuda.is_available():
             self.device = torch.cuda.current_device()
@@ -183,20 +181,71 @@ class Yolov8(Vision, EasyResource):
         return
 
 
+    def get_centroid(self, points: list) -> tuple[int, int]:
+        """Calculate the centroid of a list of points."""
+        if not points:
+            return None
+        cx = int(sum(p[0] for p in points) / len(points))
+        cy = int(sum(p[1] for p in points) / len(points))
+        
+        return cx, cy
+
+
+    def prepare_zones(self, zones):
+        """
+            Prepare and process zone data.
+
+            Args:
+                zones (dict): A dictionary where keys are zone names (str) and values are numpy arrays representing polygons.
+
+            Returns:
+                dict: Processed zones with the same structure.
+        """ 
+        # convert to numpy arrays
+        LOGGER.info(f"ZONES {zones}")
+        for zone_name, polygon in zones.items():            
+            zones[zone_name] = Polygon(polygon)
+
+        return zones
+
+
+    def classify_by_feet_centroid(self, point: tuple[Point, Point], prev_label: int, zones: dict) -> str:
+        # ── Classification Logic ──
+        in_queue   = zones[WAIT].contains(point)
+        in_fail    = zones[FAILURE].contains(point)
+        in_success = zones[SUCCESS].contains(point)
+        entered    = zones[ENTER].contains(point)
+
+        current_state = prev_label
+
+        if in_queue:
+            # Only set in queue if we saw them "ENTER" through queue entrance 
+            # OR if "in_queue for n frames"
+            if not prev_label and entered: 
+                current_state = LABEL_IN
+            elif prev_label == LABEL_IN and entered: # likely an exit 
+                current_state = LABEL_FAIL
+            else: 
+                # Likely still noise
+                current_state = prev_label
+        elif in_fail:
+            if prev_label == LABEL_IN or prev_label == LABEL_FAIL:
+                current_state = LABEL_FAIL
+            else: 
+                current_state = prev_label
+
+        elif in_success: 
+            current_state = LABEL_SUCCESS
+
+        return current_state
+
+
     def is_path(self, path: str) -> bool:
         try:
             Path(path)
             return os.path.exists(path)
         except ValueError:
             return False
-        
-
-    def get_model(self):
-        if not os.path.exists(self.MODEL_PATH):
-            MODEL_URL = f"https://huggingface.co/{self.MODEL_REPO}/resolve/main/{self.MODEL_FILE}"
-            self.logger.debug(f"Fetching model {self.MODEL_FILE} from {MODEL_URL}")
-            urlretrieve(MODEL_URL, self.MODEL_PATH, self.log_progress)
-
 
     def check_path(self, path):
         """ 
@@ -235,51 +284,85 @@ class Yolov8(Vision, EasyResource):
         image = await self.camera.get_image(mime_type="image/jpeg")
 
         return await self.get_detections(image)
+    
 
+    def get_current_state(self, track_id, keypoints): 
+        foot_pts = [point for point in keypoints[13:17] if point[0] > 5 and point[1] > 5] # feet & knees
+        current_state = LABEL_WALK
+        prev_label = self.state_labels.get(track_id, LABEL_WALK)
 
-    async def get_detections(
-        self,
-        image: ViamImage,
-        *,
-        extra: Optional[Mapping[str, ValueTypes]] = None,
-        timeout: Optional[float] = None
-    ) -> List[Detection]:
+        if len(foot_pts) < 2:
+            return str(prev_label)
 
-        detections = []
-        results = self.model.track(viam_to_pil_image(image), tracker=self.TRACKER_PATH, persist=True, classes=[0], device=self.device)[0]    # handles per frame detection updates
+        cx, cy = self.get_centroid(foot_pts)
+        current_shapely_point = Point((cx, cy))
         
-        if results is None:
-            return detections
+        current_state = self.classify_by_feet_centroid(current_shapely_point, prev_label, self.zones)
+        self.state_labels[track_id] = current_state 
 
-        for i, (xyxy, conf, track_id) in enumerate(
-                zip(results.boxes.xyxy,
-                    results.boxes.conf, 
-                    results.boxes.id)):
-            
-            # bounding box
-            x1, y1, x2, y2 = xyxy.tolist()
-            confidence     = round(conf.item(), 4) 
-            track_id       = int(track_id.item())
+        # Return int as string for detections class
+        return str(current_state)
 
-            # If no keypoints in frame, no people in frame
-            if results.keypoints is not None:
-                kpts = results.keypoints.xy[i].tolist()  # [[x,y,conf], ...]
-            else:
+    async def get_detections(self, image: ViamImage, *, extra: Optional[Mapping[str, ValueTypes]] = None, timeout: Optional[float] = None) -> List[Detection]:
+        detections = []
+        self.logger.info("GET DETECTIONS CALLED")
+        try:
+            pil_image = viam_to_pil_image(image)  # Convert ViamImage to PIL image
+            self.logger.info(f"Image converted to PIL format successfully.")
+
+            results = self.model.track(pil_image, tracker=self.TRACKER_PATH, persist=True, classes=[0], device=self.device)[0]
+
+            if results is None or results.boxes is None:
+                self.logger.error("No results or bounding boxes found.")
                 return detections
 
-            detection = {
-                "class_name": track_id,  # Overwriting class name with 
-                "confidence": confidence,
-                "x_min": int(x1) , 
-                "y_min": int(y1),
-                "x_max": int(x2),
-                "y_max": int(y2),
-            }
+            self.logger.info(f"Detection results: {results}")
 
-            detections.append(detection)
+            for i, (xyxy, conf, track_id) in enumerate(zip(results.boxes.xyxy, results.boxes.conf, results.boxes.id)):
+                self.logger.info(f"Processing detection {i}: xyxy={xyxy}, conf={conf}, track_id={track_id}")
+
+                # Convert bounding box coordinates to integers (cast to int)
+                x1, y1, x2, y2 = map(int, xyxy.tolist())  # This will ensure integer values
+                confidence = round(conf.item(), 4)
+                track_id = int(track_id.item())  # Ensure track_id is an integer
+
+                # Log bounding box and confidence types
+                self.logger.info(f"Bounding Box Type: {type(x1)}, {type(y1)}, {type(x2)}, {type(y2)}")
+                self.logger.info(f"Confidence Type: {type(confidence)}, Track ID Type: {type(track_id)}")
+
+                if results.keypoints is not None:
+                    kpts = results.keypoints.xy[i].tolist()
+                    # Get zone state 
+                    # TODO: Implement a state change 
+                    state = self.get_current_state(track_id, kpts)
+
+                    queue_state = f"{str(track_id)}_{state}"
+                    
+                else:
+                    self.logger.warning(f"No keypoints found for track {track_id}.")
+                    continue  # Skip this detection if no keypoints
+
+                
+                # Prepare detection data
+                detection = {
+                    "class_name": queue_state, 
+                    "confidence": confidence,
+                    "x_min": x1,
+                    "y_min": y1,
+                    "x_max": x2,
+                    "y_max": y2,
+                }
+
+                try:
+                    detections.append(Detection(**detection))
+                except TypeError as e:
+                    self.logger.error(f"Error creating Detection: {str(e)} with data: {detection}")
+
+        except Exception as e:
+            self.logger.error(f"Error in get_detections: {str(e)}")
 
         return detections
-    
+
 
     async def get_classifications_from_camera(
         self,
@@ -289,8 +372,7 @@ class Yolov8(Vision, EasyResource):
         extra: Optional[Mapping[str, ValueTypes]] = None,
         timeout: Optional[float] = None
     ) -> List[Classification]:
-        self.logger.error("`get_classifications_from_camera` is not implemented")
-        raise NotImplementedError()
+        pass
 
     async def get_classifications(
         self,
